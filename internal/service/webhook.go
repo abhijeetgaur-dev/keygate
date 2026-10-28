@@ -438,18 +438,27 @@ func (s *WebhookService) Dispatch(ctx context.Context, productID, event string, 
 	}
 }
 
-// DispatchWithLog dispatches webhook events and returns any error that occurs during setup.
-// Use this when the caller needs to handle or log dispatch failures explicitly.
+// claimLease is how long a sender holds a delivery row (see
+// Store.ClaimPendingDeliveries). It covers one attempt — the request
+// and its dial, both bounded by httpTimeout — with margin, and no more:
+// a replica killed mid-send holds the row only until it runs out.
+func (s *WebhookService) claimLease() time.Duration {
+	return 2*s.httpTimeout + 30*time.Second
+}
+
 // inflightHoldOff is the next_retry stamped on a delivery row while its
-// first attempt is in flight. ListPendingDeliveries treats a NULL
-// next_retry as "due now", so without it the retry loop could pick the
-// row up and POST the same delivery id a second time while the first
-// attempt is still waiting on the receiver.
+// first attempt is in flight: the lease its creator holds it by. The
+// retry loop treats a NULL next_retry as "due now", so without it
+// another replica could pick the row up and POST the same delivery id
+// a second time while the first attempt is still waiting on the
+// receiver.
 func (s *WebhookService) inflightHoldOff() *time.Time {
-	t := time.Now().Add(2*s.httpTimeout + 30*time.Second)
+	t := time.Now().Add(s.claimLease())
 	return &t
 }
 
+// DispatchWithLog dispatches webhook events and returns any error that occurs during setup.
+// Use this when the caller needs to handle or log dispatch failures explicitly.
 func (s *WebhookService) DispatchWithLog(ctx context.Context, productID, event string, data map[string]any) error {
 	webhooks, err := s.store.FindWebhooksForEvent(ctx, productID, event)
 	if err != nil {
@@ -524,7 +533,24 @@ func (s *WebhookService) DeliverTest(ctx context.Context, wh *model.Webhook) (*m
 	return delivery, nil
 }
 
+// deliver sends one attempt of a delivery the caller holds by its claim
+// token. The caller has taken a sending slot first, and may have waited
+// for it past the lease it claimed the row with, so the claim is
+// renewed here, immediately before the send: a row taken over by
+// another replica meanwhile is that replica's to send, not this one's.
 func (s *WebhookService) deliver(ctx context.Context, wh *model.Webhook, delivery *model.WebhookDelivery) {
+	held, err := s.store.RenewWebhookClaim(ctx, delivery.ID, delivery.ClaimToken, s.claimLease())
+	if err != nil {
+		// Not sent, and the lease is left to run out, so a later pass
+		// retries it.
+		s.logger.Error("webhook claim renewal failed", "delivery_id", delivery.ID, "error", err)
+		return
+	}
+	if !held {
+		s.logger.Warn("webhook delivery was taken over before it was sent", "delivery_id", delivery.ID)
+		return
+	}
+
 	body, _ := json.Marshal(delivery.Payload)
 	sig := signPayload(body, wh.Secret)
 
@@ -558,7 +584,20 @@ func (s *WebhookService) deliver(ctx context.Context, wh *model.Webhook, deliver
 	} else {
 		s.scheduleRetry(delivery)
 	}
-	_ = s.store.UpdateWebhookDelivery(ctx, delivery)
+	s.finish(ctx, delivery)
+}
+
+// finish writes an attempt's outcome to a delivery this sender holds,
+// and lets go of it.
+func (s *WebhookService) finish(ctx context.Context, d *model.WebhookDelivery) {
+	held, err := s.store.FinishWebhookDelivery(ctx, d)
+	if err != nil {
+		s.logger.Error("webhook delivery update failed", "delivery_id", d.ID, "error", err)
+		return
+	}
+	if !held {
+		s.logger.Warn("webhook delivery was taken over before its attempt finished", "delivery_id", d.ID)
+	}
 }
 
 func (s *WebhookService) scheduleRetry(d *model.WebhookDelivery) {
@@ -579,7 +618,7 @@ func (s *WebhookService) failDelivery(ctx context.Context, d *model.WebhookDeliv
 	d.ResponseCode = code
 	d.ResponseBody = body
 	s.scheduleRetry(d)
-	_ = s.store.UpdateWebhookDelivery(ctx, d)
+	s.finish(ctx, d)
 }
 
 // ErrWebhookDeliveryNotResendable is returned by Redispatch when the
@@ -632,8 +671,11 @@ func (s *WebhookService) Redispatch(ctx context.Context, deliveryID string) (*mo
 }
 
 func (s *WebhookService) ProcessRetries(ctx context.Context) {
-	deliveries, err := s.store.ListPendingDeliveries(ctx, 50)
-	if err != nil || len(deliveries) == 0 {
+	// Claimed, not just listed: every replica runs this loop, and
+	// another one ticking at the same moment gets different rows.
+	deliveries, err := s.store.ClaimPendingDeliveries(ctx, 50, s.claimLease())
+	if err != nil {
+		s.logger.Error("webhook retry claim failed", "error", err)
 		return
 	}
 	for _, d := range deliveries {
@@ -643,14 +685,7 @@ func (s *WebhookService) ProcessRetries(ctx context.Context) {
 			// delivery, so stop re-listing it every tick.
 			d.Status = "failed"
 			d.NextRetry = nil
-			_ = s.store.UpdateWebhookDelivery(ctx, d)
-			continue
-		}
-		// Claim the row before the goroutine (which may sit on the
-		// semaphore past the next tick) so the next ProcessRetries does
-		// not list it again and POST the same delivery id twice.
-		d.NextRetry = s.inflightHoldOff()
-		if err := s.store.UpdateWebhookDelivery(ctx, d); err != nil {
+			s.finish(ctx, d)
 			continue
 		}
 		go func(wh *model.Webhook, d *model.WebhookDelivery) {

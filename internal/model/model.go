@@ -718,6 +718,9 @@ type WebhookDelivery struct {
 	Status        string         `bun:",notnull,default:'pending'" json:"status"`
 	CreatedAt     time.Time      `bun:",nullzero,default:now()" json:"created_at"`
 	DeliveredAt   *time.Time     `json:"delivered_at,omitempty"`
+	// ClaimToken identifies the sender holding the row while it is
+	// sent (see Store.ClaimPendingDeliveries); empty when nobody does.
+	ClaimToken string `bun:",notnull,default:''" json:"-"`
 }
 
 // ─── Subscription ───
